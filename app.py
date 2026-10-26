@@ -1,243 +1,143 @@
-from flask import Flask, request, jsonify
-import sqlite3
-from datetime import datetime, timedelta
-import os
+import requests
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import threading
+import time
 
-app = Flask(__name__)
-DB_FILE = "minizo.db"
-SECRET_BOT_KEY = "BOT_SECRET_123" # Đổi thành mật khẩu của bạn
-SECRET_APP_KEY = "APP_SECRET_456" # Đổi thành mật khẩu của bạn
+TELEGRAM_TOKEN = "TOKEN_BOT_CUA_BAN"
+RENDER_URL = "https://minizo-sevaapi.onrender.com"
+BOT_SECRET = "BOT_SECRET_123"
+ADMIN_ID = 123456789 # ID Telegram của bạn
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    # Bảng Keys
-    c.execute('''CREATE TABLE IF NOT EXISTS keys (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        key_code TEXT UNIQUE,
-        device_id TEXT,
-        created_at TIMESTAMP,
-        expires_at TIMESTAMP,
-        status TEXT DEFAULT 'UNUSED'
-    )''')
-    # Bảng Máy
-    c.execute('''CREATE TABLE IF NOT EXISTS devices (
-        device_id TEXT PRIMARY KEY,
-        device_name TEXT,
-        ip_address TEXT,
-        carrier TEXT,
-        android_version TEXT,
-        last_login TIMESTAMP,
-        key_code TEXT
-    )''')
-    # Bảng Blacklist
-    c.execute('''CREATE TABLE IF NOT EXISTS blacklist (
-        device_id TEXT PRIMARY KEY,
-        reason TEXT,
-        banned_at TIMESTAMP
-    )''')
-    # Bảng Login Attempts (Chống spam nhập sai)
-    c.execute('''CREATE TABLE IF NOT EXISTS login_attempts (
-        device_id TEXT PRIMARY KEY,
-        fail_count INTEGER DEFAULT 0,
-        locked_until TIMESTAMP
-    )''')
-    # Bảng Cấu hình Server
-    c.execute('''CREATE TABLE IF NOT EXISTS server_config (
-        id INTEGER PRIMARY KEY,
-        status TEXT DEFAULT 'ACTIVE',
-        update_message TEXT
-    )''')
-    c.execute("INSERT OR IGNORE INTO server_config (id, status, update_message) VALUES (1, 'ACTIVE', '')")
-    conn.commit()
-    conn.close()
+def ping_loop():
+    while True:
+        try: requests.get(f"{RENDER_URL}/ping", timeout=10)
+        except: pass
+        time.sleep(300)
 
-init_db()
+def call_api(action, payload):
+    payload['action'] = action
+    try:
+        res = requests.post(f"{RENDER_URL}/api/bot", json=payload, headers={"X-Bot-Key": BOT_SECRET}, timeout=60)
+        return res.json()
+    except Exception as e:
+        return {"status": "ERROR", "message": f"Lỗi: {e}"}
 
-def check_bot_auth():
-    return request.headers.get("X-Bot-Key") == SECRET_BOT_KEY
+async def check_admin(update: Update):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Bạn không phải Admin!")
+        return False
+    return True
 
-def check_app_auth():
-    return request.headers.get("X-App-Key") == SECRET_APP_KEY
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update): return
+    text = """📜 DANH SÁCH LỆNH:
+/ping /taokey /vinhvien /xemkey /xoakey /xoacode
+/resetmay /allmay /thongtin /kick /backlist
+/xoabacklist /thongke /lockupdate /unlockupdate"""
+    await update.message.reply_text(text)
 
-# --- API CHO BOT 1 (Telegram) ---
-@app.route('/api/bot', methods=['POST'])
-def bot_command():
-    if not check_bot_auth(): return jsonify({"status": "ERROR", "message": "Unauthorized"}), 401
-    data = request.json
-    action = data.get('action')
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update): return
+    msg = await update.message.reply_text("⏳ Đang gọi Server...")
+    try:
+        res = requests.get(f"{RENDER_URL}/ping", timeout=60)
+        if "ALIVE" in res.text: await msg.edit_text("✅ Server đã thức!")
+        else: await msg.edit_text("⚠️ Lỗi Server.")
+    except Exception as e: await msg.edit_text(f"❌ {e}")
 
-    if action == 'create_key':
-        key = data.get('key_code')
-        hours = int(data.get('hours', 0))
-        expires = None if hours == 0 else (datetime.now() + timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
-        try:
-            c.execute("INSERT INTO keys (key_code, created_at, expires_at) VALUES (?, ?, ?)", (key, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), expires))
-            conn.commit()
-            return jsonify({"status": "OK", "message": f"Đã tạo key {key}"})
-        except:
-            return jsonify({"status": "ERROR", "message": "Key đã tồn tại"})
+async def cmd_taokey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update) or len(context.args) < 1: return await update.message.reply_text("Cú pháp: /taokey <giờ>")
+    hours = int(context.args[0])
+    key = f"MINIZO-{int(time.time())}"
+    res = call_api('create_key', {"key_code": key, "hours": hours})
+    await update.message.reply_text(f"✅ Key: `{key}`" if res['status']=='OK' else f"❌ {res['message']}", parse_mode='Markdown')
 
-    elif action == 'delete_key':
-        key = data.get('key_code')
-        c.execute("DELETE FROM keys WHERE key_code = ?", (key,))
-        conn.commit()
-        return jsonify({"status": "OK", "message": f"Đã xóa key {key}"})
+async def cmd_vinhvien(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update): return
+    key = f"MINIZO-VIP-{int(time.time())}"
+    res = call_api('create_key', {"key_code": key, "hours": 0})
+    await update.message.reply_text(f"✅ Key VIP: `{key}`" if res['status']=='OK' else f"❌ {res['message']}", parse_mode='Markdown')
 
-    elif action == 'all_devices':
-        c.execute("SELECT * FROM devices ORDER BY last_login DESC")
-        rows = c.fetchall()
-        return jsonify({"status": "OK", "data": rows})
+async def cmd_xemkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update) or len(context.args) < 1: return await update.message.reply_text("Cú pháp: /xemkey <key>")
+    res = call_api('get_key_info', {"key_code": context.args[0]})
+    if res['status'] == 'OK':
+        d = res['data']
+        await update.message.reply_text(f"🔍 Key: {d[1]}\nMáy: {d[2]}\nHạn: {d[4]}\nTrạng thái: {d[5]}")
+    else: await update.message.reply_text(f"❌ {res['message']}")
 
-    elif action == 'device_info':
-        idx = int(data.get('index', 1)) - 1
-        c.execute("SELECT * FROM devices ORDER BY last_login DESC LIMIT 1 OFFSET ?", (idx,))
-        row = c.fetchone()
-        if row: return jsonify({"status": "OK", "data": row})
-        return jsonify({"status": "ERROR", "message": "Không tìm thấy máy"})
+async def cmd_xoakey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update) or len(context.args) < 1: return await update.message.reply_text("Cú pháp: /xoakey <key>")
+    res = call_api('delete_key', {"key_code": context.args[0]})
+    await update.message.reply_text(f"🗑️ {res['message']}")
 
-    elif action == 'blacklist':
-        dev_id = data.get('device_id')
-        c.execute("INSERT OR REPLACE INTO blacklist (device_id, reason, banned_at) VALUES (?, ?, ?)", (dev_id, "Vi phạm", datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-        conn.commit()
-        return jsonify({"status": "OK", "message": f"Đã ban {dev_id}"})
+async def cmd_xoacode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update): return
+    res = call_api('delete_all', {})
+    await update.message.reply_text(f"🧹 {res['message']}")
 
-    elif action == 'unblacklist':
-        dev_id = data.get('device_id')
-        c.execute("DELETE FROM blacklist WHERE device_id = ?", (dev_id,))
-        conn.commit()
-        return jsonify({"status": "OK", "message": f"Đã gỡ ban {dev_id}"})
+async def cmd_resetmay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update) or len(context.args) < 1: return await update.message.reply_text("Cú pháp: /resetmay <key>")
+    res = call_api('reset_device', {"key_code": context.args[0]})
+    await update.message.reply_text(f"🔄 {res['message']}")
 
-    elif action == 'stats':
-        c.execute("SELECT COUNT(*) FROM devices")
-        total_dev = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM keys")
-        total_key = c.fetchone()[0]
-        return jsonify({"status": "OK", "message": f"Tổng máy: {total_dev} | Tổng Key: {total_key}"})
+async def cmd_allmay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update): return
+    res = call_api('all_devices', {})
+    if res['status'] == 'OK':
+        msg = "📱 MÁY:\n" + "\n".join([f"{i+1}. {d[1]} - `{d[0]}`" for i, d in enumerate(res['data'])])
+        await update.message.reply_text(msg, parse_mode='Markdown')
+    else: await update.message.reply_text(f"❌ {res['message']}")
 
-    elif action == 'lock_update':
-        c.execute("UPDATE server_config SET status = 'LOCKED', update_message = ? WHERE id = 1", (data.get('message', 'Ứng dụng đang cập nhật'),))
-        conn.commit()
-        return jsonify({"status": "OK", "message": "Đã khóa toàn bộ App"})
+async def cmd_thongtin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update) or len(context.args) < 1: return await update.message.reply_text("Cú pháp: /thongtin <số>")
+    res = call_api('device_info', {"index": context.args[0]})
+    if res['status'] == 'OK':
+        d = res['data']
+        await update.message.reply_text(f"📱 Máy: {d[1]}\nMã: {d[0]}\nIP: {d[2]}\nMạng: {d[3]}\nKey: {d[6]}")
+    else: await update.message.reply_text(f"❌ {res['message']}")
 
-    elif action == 'unlock_update':
-        c.execute("UPDATE server_config SET status = 'ACTIVE' WHERE id = 1")
-        conn.commit()
-        return jsonify({"status": "OK", "message": "Đã mở khóa App"})
+async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update) or len(context.args) < 1: return await update.message.reply_text("Cú pháp: /kick <mã_máy>")
+    res = call_api('kick_device', {"device_id": context.args[0]})
+    await update.message.reply_text(f"👢 {res['message']}")
 
-    elif action == 'delete_all':
-        c.execute("DELETE FROM keys")
-        c.execute("DELETE FROM devices")
-        c.execute("DELETE FROM blacklist")
-        c.execute("DELETE FROM login_attempts")
-        conn.commit()
-        return jsonify({"status": "OK", "message": "Đã xóa toàn bộ dữ liệu"})
+async def cmd_backlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update) or len(context.args) < 1: return await update.message.reply_text("Cú pháp: /backlist <mã_máy>")
+    res = call_api('blacklist', {"device_id": context.args[0]})
+    await update.message.reply_text(f"🚫 {res['message']}")
 
-    conn.close()
-    return jsonify({"status": "ERROR", "message": "Lệnh không hợp lệ"})
+async def cmd_xoabacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update) or len(context.args) < 1: return await update.message.reply_text("Cú pháp: /xoabacklist <mã_máy>")
+    res = call_api('unblacklist', {"device_id": context.args[0]})
+    await update.message.reply_text(f"✅ {res['message']}")
 
-# --- API CHO APP ---
-@app.route('/api/check_key', methods=['POST'])
-def check_key():
-    if not check_app_auth(): return jsonify({"status": "ERROR", "message": "Unauthorized"}), 401
-    
-    # 0. Check Trạng thái Update
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT status, update_message FROM server_config WHERE id = 1")
-    config = c.fetchone()
-    if config and config[0] == 'LOCKED':
-        conn.close()
-        return jsonify({"status": "LOCKED", "message": config[1]})
+async def cmd_thongke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update): return
+    res = call_api('stats', {})
+    await update.message.reply_text(f"📊 {res['message']}")
 
-    data = request.json
-    key_code = data.get('key_code')
-    device_id = data.get('device_id')
-    device_name = data.get('device_name', 'Unknown')
-    ip = data.get('ip', '0.0.0.0')
-    carrier = data.get('carrier', 'Unknown')
-    android_ver = data.get('android_version', 'Unknown')
+async def cmd_lockupdate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update): return
+    res = call_api('lock_update', {"message": "Ứng dụng đang bảo trì, vui lòng quay lại sau!"})
+    await update.message.reply_text(f"🔒 {res['message']}")
 
-    if not key_code or not device_id:
-        conn.close()
-        return jsonify({"status": "ERROR", "message": "Missing data"}), 400
-
-    # 1. Check Blacklist
-    c.execute("SELECT * FROM blacklist WHERE device_id = ?", (device_id,))
-    if c.fetchone():
-        conn.close()
-        return jsonify({"status": "ERROR", "message": "Máy bạn đã bị blacklist. Liên hệ Admin!"})
-
-    # 2. Check Khóa 10 phút
-    c.execute("SELECT locked_until FROM login_attempts WHERE device_id = ?", (device_id,))
-    lock = c.fetchone()
-    if lock and lock[0]:
-        locked_until = datetime.strptime(lock[0], '%Y-%m-%d %H:%M:%S')
-        if datetime.now() < locked_until:
-            rem = int((locked_until - datetime.now()).total_seconds() / 60)
-            conn.close()
-            return jsonify({"status": "ERROR", "message": f"Bạn đã nhập sai 3 lần. Bị khóa {rem} phút!"})
-        else:
-            c.execute("UPDATE login_attempts SET fail_count = 0, locked_until = NULL WHERE device_id = ?", (device_id,))
-            conn.commit()
-
-    # 3. Check Key
-    c.execute("SELECT * FROM keys WHERE key_code = ?", (key_code,))
-    row = c.fetchone()
-
-    if not row:
-        msg = "Key không tồn tại"
-        success = False
-    else:
-        key_id, key_code_db, device_id_db, created_at, expires_at, status = row
-        if expires_at and datetime.now() > datetime.strptime(expires_at, '%Y-%m-%d %H:%M:%S'):
-            msg = "Key đã hết hạn"
-            success = False
-        elif status == 'BANNED':
-            msg = "Key đã bị khóa"
-            success = False
-        elif device_id_db is None:
-            c.execute("UPDATE keys SET device_id = ?, status = 'ACTIVE' WHERE key_code = ?", (device_id, key_code))
-            success = True
-            msg = "Kích hoạt thành công"
-        elif device_id_db == device_id:
-            success = True
-            msg = "Đăng nhập thành công"
-        else:
-            msg = "Key đã dùng trên máy khác"
-            success = False
-
-    # 4. Lưu thông tin máy & Xử lý sai
-    if success:
-        c.execute("INSERT OR REPLACE INTO devices (device_id, device_name, ip_address, carrier, android_version, last_login, key_code) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                  (device_id, device_name, ip, carrier, android_ver, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), key_code))
-        c.execute("UPDATE login_attempts SET fail_count = 0, locked_until = NULL WHERE device_id = ?", (device_id,))
-        conn.commit()
-    else:
-        c.execute("SELECT fail_count FROM login_attempts WHERE device_id = ?", (device_id,))
-        att = c.fetchone()
-        if att:
-            fail_count = att[0] + 1
-            if fail_count >= 3:
-                locked_until = (datetime.now() + timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')
-                c.execute("UPDATE login_attempts SET fail_count = ?, locked_until = ? WHERE device_id = ?", (fail_count, locked_until, device_id))
-                msg = "Sai 3 lần. Bị khóa 10 phút!"
-            else:
-                c.execute("UPDATE login_attempts SET fail_count = ? WHERE device_id = ?", (fail_count, device_id))
-                msg = f"Sai key ({fail_count}/3)"
-        else:
-            c.execute("INSERT INTO login_attempts (device_id, fail_count) VALUES (?, 1)", (device_id,))
-            msg = "Sai key (1/3)"
-        conn.commit()
-
-    conn.close()
-    return jsonify({"status": "OK" if success else "ERROR", "message": msg})
-
-@app.route('/ping', methods=['GET'])
-def ping():
-    return "ALIVE"
+async def cmd_unlockupdate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update): return
+    res = call_api('unlock_update', {})
+    await update.message.reply_text(f"🔓 {res['message']}")
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    threading.Thread(target=ping_loop, daemon=True).start()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    commands = {
+        "help": cmd_help, "ping": cmd_ping, "taokey": cmd_taokey, "vinhvien": cmd_vinhvien,
+        "xemkey": cmd_xemkey, "xoakey": cmd_xoakey, "xoacode": cmd_xoacode, "resetmay": cmd_resetmay,
+        "allmay": cmd_allmay, "thongtin": cmd_thongtin, "kick": cmd_kick, "backlist": cmd_backlist,
+        "xoabacklist": cmd_xoabacklist, "thongke": cmd_thongke, "lockupdate": cmd_lockupdate, "unlockupdate": cmd_unlockupdate
+    }
+    for cmd, func in commands.items():
+        app.add_handler(CommandHandler(cmd, func))
+    print("Bot đang chạy full lệnh...")
+    app.run_polling()
