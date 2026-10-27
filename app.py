@@ -54,7 +54,6 @@ init_db()
 def check_bot_auth(): return request.headers.get("X-Bot-Key") == SECRET_BOT_KEY
 def check_app_auth(): return request.headers.get("X-App-Key") == SECRET_APP_KEY
 
-# --- API CHO BOT 1 (TELEGRAM) ---
 @app.route('/api/bot', methods=['POST'])
 def bot_command():
     if not check_bot_auth(): return jsonify({"status": "ERROR", "message": "Unauthorized"}), 401
@@ -161,7 +160,6 @@ def bot_command():
     
     return jsonify({"status": "ERROR", "message": "Lệnh không hợp lệ"})
 
-# --- API CHO APP ---
 @app.route('/api/check_key', methods=['POST'])
 def check_key():
     if not check_app_auth(): return jsonify({"status": "ERROR", "message": "Unauthorized"}), 401
@@ -267,7 +265,11 @@ def check_status():
     c = conn.cursor()
     try:
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute("UPDATE devices SET last_seen = ? WHERE device_id = ?", (now_str, device_id))
+        c.execute("SELECT device_id FROM devices WHERE device_id = ?", (device_id,))
+        if c.fetchone():
+            c.execute("UPDATE devices SET last_seen = ? WHERE device_id = ?", (now_str, device_id))
+        else:
+            c.execute("INSERT INTO devices (device_id, last_seen) VALUES (?, ?)", (device_id, now_str))
         conn.commit()
 
         c.execute("SELECT * FROM blacklist WHERE device_id = ?", (device_id,))
