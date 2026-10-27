@@ -3,7 +3,6 @@ import sqlite3
 from datetime import datetime, timedelta
 import os
 
-# KHỞI TẠO APP (Bắt buộc phải có)
 app = Flask(__name__)
 
 DB_FILE = "minizo.db"
@@ -13,7 +12,6 @@ SECRET_APP_KEY = "APP_SECRET_456"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Bảng Keys
     c.execute('''CREATE TABLE IF NOT EXISTS keys (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         key_code TEXT UNIQUE,
@@ -22,7 +20,6 @@ def init_db():
         expires_at TIMESTAMP,
         status TEXT DEFAULT 'UNUSED'
     )''')
-    # Bảng Máy
     c.execute('''CREATE TABLE IF NOT EXISTS devices (
         device_id TEXT PRIMARY KEY,
         device_name TEXT,
@@ -30,21 +27,19 @@ def init_db():
         carrier TEXT,
         android_version TEXT,
         last_login TIMESTAMP,
-        key_code TEXT
+        key_code TEXT,
+        last_seen TIMESTAMP
     )''')
-    # Bảng Blacklist
     c.execute('''CREATE TABLE IF NOT EXISTS blacklist (
         device_id TEXT PRIMARY KEY,
         reason TEXT,
         banned_at TIMESTAMP
     )''')
-    # Bảng Login Attempts
     c.execute('''CREATE TABLE IF NOT EXISTS login_attempts (
         device_id TEXT PRIMARY KEY,
         fail_count INTEGER DEFAULT 0,
         locked_until TIMESTAMP
     )''')
-    # Bảng Cấu hình Server
     c.execute('''CREATE TABLE IF NOT EXISTS server_config (
         id INTEGER PRIMARY KEY,
         status TEXT DEFAULT 'ACTIVE',
@@ -107,7 +102,6 @@ def bot_command():
 
         elif action == 'kick_device':
             dev_id = data.get('device_id')
-            # Xóa key khỏi máy này để App bắt buộc phải nhập lại
             c.execute("UPDATE devices SET key_code = NULL WHERE device_id = ?", (dev_id,))
             c.execute("UPDATE keys SET device_id = NULL, status = 'UNUSED' WHERE device_id = ?", (dev_id,))
             conn.commit()
@@ -137,6 +131,12 @@ def bot_command():
             c.execute("SELECT COUNT(*) FROM keys")
             total_key = c.fetchone()[0]
             return jsonify({"status": "OK", "message": f"Tổng máy: {total_dev} | Tổng Key: {total_key}"})
+
+        elif action == 'online_devices':
+            two_min_ago = (datetime.now() - timedelta(minutes=2)).strftime('%Y-%m-%d %H:%M:%S')
+            c.execute("SELECT device_id, device_name, ip_address, last_seen FROM devices WHERE last_seen > ? ORDER BY last_seen DESC", (two_min_ago,))
+            rows = c.fetchall()
+            return jsonify({"status": "OK", "data": rows})
 
         elif action == 'lock_update':
             c.execute("UPDATE server_config SET status = 'LOCKED', update_message = ? WHERE id = 1", (data.get('message', 'Ứng dụng đang cập nhật'),))
@@ -170,7 +170,6 @@ def check_key():
     c = conn.cursor()
     
     try:
-        # Check Update Lock
         c.execute("SELECT status, update_message FROM server_config WHERE id = 1")
         config = c.fetchone()
         if config and config[0] == 'LOCKED':
@@ -187,12 +186,10 @@ def check_key():
         if not key_code or not device_id:
             return jsonify({"status": "ERROR", "message": "Missing data"}), 400
 
-        # 1. Check Blacklist (Ưu tiên số 1)
         c.execute("SELECT * FROM blacklist WHERE device_id = ?", (device_id,))
         if c.fetchone():
             return jsonify({"status": "ERROR", "message": "Máy bạn đã bị blacklist. Liên hệ Admin!"})
 
-        # 2. Check Lock 10p
         c.execute("SELECT locked_until FROM login_attempts WHERE device_id = ?", (device_id,))
         lock = c.fetchone()
         if lock and lock[0]:
@@ -204,7 +201,6 @@ def check_key():
                 c.execute("UPDATE login_attempts SET fail_count = 0, locked_until = NULL WHERE device_id = ?", (device_id,))
                 conn.commit()
 
-        # 3. Check Key
         c.execute("SELECT * FROM keys WHERE key_code = ?", (key_code,))
         row = c.fetchone()
 
@@ -220,22 +216,20 @@ def check_key():
                 msg = "Key đã bị khóa"
                 success = False
             elif device_id_db is None:
-                # Nếu key chưa dùng, gán máy này vào
                 c.execute("UPDATE keys SET device_id = ?, status = 'ACTIVE' WHERE key_code = ?", (device_id, key_code))
                 success = True
                 msg = "Kích hoạt thành công"
             elif device_id_db == device_id:
-                # Đúng máy
                 success = True
                 msg = "Đăng nhập thành công"
             else:
                 msg = "Key đã dùng trên máy khác"
                 success = False
 
-        # 4. Lưu info & Count sai
         if success:
-            c.execute("INSERT OR REPLACE INTO devices (device_id, device_name, ip_address, carrier, android_version, last_login, key_code) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (device_id, device_name, ip, carrier, android_ver, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), key_code))
+            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            c.execute("INSERT OR REPLACE INTO devices (device_id, device_name, ip_address, carrier, android_version, last_login, key_code, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                      (device_id, device_name, ip, carrier, android_ver, now_str, key_code, now_str))
             c.execute("UPDATE login_attempts SET fail_count = 0, locked_until = NULL WHERE device_id = ?", (device_id,))
             conn.commit()
             return jsonify({"status": "OK", "message": msg})
@@ -260,7 +254,6 @@ def check_key():
     finally:
         conn.close()
 
-# --- API MỚI: CHỈ CHECK TRẠNG THÁI (DÀNH CHO APP CHẠY NGẦM) ---
 @app.route('/api/check_status', methods=['POST'])
 def check_status():
     if not check_app_auth(): return jsonify({"status": "ERROR", "message": "Unauthorized"}), 401
@@ -273,18 +266,19 @@ def check_status():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
-        # 1. Check Blacklist
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        c.execute("UPDATE devices SET last_seen = ? WHERE device_id = ?", (now_str, device_id))
+        conn.commit()
+
         c.execute("SELECT * FROM blacklist WHERE device_id = ?", (device_id,))
         if c.fetchone():
             return jsonify({"status": "BANNED", "message": "Máy bạn đã bị blacklist. Liên hệ Admin!"})
 
-        # 2. Check Update Lock
         c.execute("SELECT status FROM server_config WHERE id = 1")
         config = c.fetchone()
         if config and config[0] == 'LOCKED':
             return jsonify({"status": "LOCKED", "message": "Ứng dụng đang cập nhật"})
 
-        # 3. Kiểm tra xem máy có đang dùng Key nào không (nếu bị kick, key_code sẽ bị xóa)
         c.execute("SELECT key_code FROM devices WHERE device_id = ?", (device_id,))
         row = c.fetchone()
         if not row or row[0] is None:
